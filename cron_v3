@@ -1,0 +1,55 @@
+USE lavidaloca;
+
+-- ============================================================
+-- STATISTIEKEN SNAPSHOTS
+-- ============================================================
+CREATE TABLE IF NOT EXISTS daily_stats (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    stat_date DATE NOT NULL UNIQUE,
+    total_users INT DEFAULT 0,
+    active_users INT DEFAULT 0,
+    total_money BIGINT DEFAULT 0,
+    total_bank BIGINT DEFAULT 0,
+    total_cars INT DEFAULT 0,
+    total_drugs INT DEFAULT 0,
+    total_races INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- WEEKELIJKSE RANKING
+-- ============================================================
+CREATE TABLE IF NOT EXISTS weekly_ranking (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    week_start DATE NOT NULL,
+    week_end DATE NOT NULL,
+    category ENUM('money','xp','races','crimes') NOT NULL,
+    user_id INT NOT NULL,
+    score BIGINT DEFAULT 0,
+    position INT DEFAULT 0,
+    reward INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX (week_start),
+    INDEX (category)
+);
+
+-- ============================================================
+-- SURPRISE GIFTS LOG
+-- ============================================================
+CREATE TABLE IF NOT EXISTS gift_log (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    gift_type VARCHAR(32),
+    amount INT DEFAULT 0,
+    message VARCHAR(255),
+    claimed TINYINT(1) DEFAULT 0,
+    given_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX (user_id),
+    INDEX (claimed)
+);
+
+-- ============================================================
+-- RACE AUTO-CLEANUP — races die te lang wachten
+-- ============================================================
+ALTER TABLE races
+    ADD COLUMN auto_cancelled TINYINT(1) DEFAULT 0;
