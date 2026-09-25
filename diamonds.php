@@ -1,103 +1,107 @@
 <?php
-/**
- * Vendetta — Diamanten (premium currency)
- * BELANGRIJK: Alleen functies en constanten.
- */
+$adminPageTitle = 'Diamanten beheer';
+require __DIR__ . '/includes/admin_header.php';
 
-const DIAMOND_EUR_RATE = 100000;  // 1 💎 = €100.000
+$error = null;
+$success = null;
 
-function getUserDiamonds(PDO $pdo, int $userId): int {
-    $stmt = $pdo->prepare("SELECT diamonds FROM users WHERE id = ? LIMIT 1");
-    $stmt->execute([$userId]);
-    return (int)$stmt->fetchColumn();
-}
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    $userId = (int)($_POST['user_id'] ?? 0);
+    $amount = (int)($_POST['amount'] ?? 0);
+    $reason = trim($_POST['reason'] ?? 'Admin actie');
+    $csrf = $_POST['csrf'] ?? '';
 
-function addDiamonds(PDO $pdo, int $userId, int $amount, string $type = 'reward', string $desc = ''): void {
-    if ($amount <= 0) return;
-
-    $pdo->prepare("
-        UPDATE users
-        SET diamonds = diamonds + ?, total_diamonds_earned = total_diamonds_earned + ?
-        WHERE id = ?
-    ")->execute([$amount, $amount, $userId]);
-
-    try {
-        $pdo->prepare("
-            INSERT INTO diamond_transactions (user_id, amount, type, description)
-            VALUES (?, ?, ?, ?)
-        ")->execute([$userId, $amount, $type, $desc]);
-    } catch (Exception $e) {}
-}
-
-function removeDiamonds(PDO $pdo, int $userId, int $amount, string $type = 'spend', string $desc = ''): bool {
-    if ($amount <= 0) return false;
-
-    $stmt = $pdo->prepare("SELECT diamonds FROM users WHERE id = ? LIMIT 1");
-    $stmt->execute([$userId]);
-    $have = (int)$stmt->fetchColumn();
-
-    if ($have < $amount) return false;
-
-    $pdo->prepare("
-        UPDATE users
-        SET diamonds = diamonds - ?, total_diamonds_spent = total_diamonds_spent + ?
-        WHERE id = ?
-    ")->execute([$amount, $amount, $userId]);
-
-    try {
-        $pdo->prepare("
-            INSERT INTO diamond_transactions (user_id, amount, type, description)
-            VALUES (?, ?, ?, ?)
-        ")->execute([$userId, -$amount, $type, $desc]);
-    } catch (Exception $e) {}
-
-    return true;
-}
-
-function getDiamondTransactions(PDO $pdo, int $userId, int $limit = 20): array {
-    $stmt = $pdo->prepare("
-        SELECT * FROM diamond_transactions
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-    ");
-    $stmt->bindValue(1, $userId, PDO::PARAM_INT);
-    $stmt->bindValue(2, $limit, PDO::PARAM_INT);
-    $stmt->execute();
-    return $stmt->fetchAll();
-}
-
-function buyMoneyWithDiamonds(PDO $pdo, int $userId, int $diamonds): array {
-    if ($diamonds < 1) return ['error' => 'Minimum 1 diamant'];
-
-    $have = getUserDiamonds($pdo, $userId);
-    if ($have < $diamonds) return ['error' => 'Niet genoeg diamanten'];
-
-    $eur = $diamonds * DIAMOND_EUR_RATE;
-
-    $pdo->beginTransaction();
-    try {
-        $pdo->prepare("UPDATE users SET money = money + ? WHERE id = ?")->execute([$eur, $userId]);
-        removeDiamonds($pdo, $userId, $diamonds, 'buy_money', "€" . number_format($eur, 0, ',', '.'));
-        if (function_exists('logActivity')) {
-            logActivity($pdo, $userId, "💎 {$diamonds} diamanten → €" . number_format($eur, 0, ',', '.'));
+    if (!hash_equals(csrf_token(), $csrf)) {
+        $error = 'Ongeldige sessie.';
+    } elseif ($userId <= 0) {
+        $error = 'Geen speler gekozen.';
+    } elseif ($action === 'add') {
+        addDiamonds($pdo, $userId, $amount, 'admin_add', $reason);
+        adminLog($pdo, $admin['id'], 'add_diamonds', 'user', $userId, "+{$amount} — {$reason}");
+        $success = "{$amount} 💎 gegeven!";
+    } elseif ($action === 'remove') {
+        if (removeDiamonds($pdo, $userId, $amount, 'admin_remove', $reason)) {
+            adminLog($pdo, $admin['id'], 'remove_diamonds', 'user', $userId, "-{$amount} — {$reason}");
+            $success = "{$amount} 💎 afgenomen!";
+        } else {
+            $error = 'Niet genoeg diamanten om af te nemen.';
         }
-        $pdo->commit();
-
-        return ['success' => true, 'eur' => $eur, 'diamonds' => $diamonds];
-    } catch (Exception $e) {
-        $pdo->rollBack();
-        return ['error' => 'Aankoop mislukt'];
+    } elseif ($action === 'set') {
+        $stmt = $pdo->prepare("UPDATE users SET diamonds = ? WHERE id = ?");
+        $stmt->execute([$amount, $userId]);
+        adminLog($pdo, $admin['id'], 'set_diamonds', 'user', $userId, "= {$amount}");
+        $success = "Diamanten gezet op {$amount} 💎";
     }
 }
 
-function getDiamondStats(PDO $pdo, int $userId): array {
-    $stmt = $pdo->prepare("SELECT diamonds, total_diamonds_earned, total_diamonds_spent FROM users WHERE id = ?");
-    $stmt->execute([$userId]);
-    $u = $stmt->fetch();
-    return [
-        'diamonds'     => (int)($u['diamonds'] ?? 0),
-        'total_earned' => (int)($u['total_diamonds_earned'] ?? 0),
-        'total_spent'  => (int)($u['total_diamonds_spent'] ?? 0),
-    ];
-}
+// Top diamant houders
+$top = $pdo->query("SELECT id, username, diamonds FROM users ORDER BY diamonds DESC LIMIT 15")->fetchAll();
+
+// Recente transacties
+$recent = $pdo->query("
+    SELECT dt.*, u.username
+    FROM diamond_transactions dt
+    JOIN users u ON u.id = dt.user_id
+    ORDER BY dt.id DESC LIMIT 20
+")->fetchAll();
+?>
+
+<h1 class="admin-title">💎 Diamanten beheer</h1>
+
+<?php if ($error): ?><div class="admin-alert admin-alert-error"><?= htmlspecialchars($error) ?></div><?php endif; ?>
+<?php if ($success): ?><div class="admin-alert admin-alert-success"><?= htmlspecialchars($success) ?></div><?php endif; ?>
+
+<section class="admin-section">
+    <h2>💎 Diamanten aanpassen</h2>
+    <form method="POST" class="admin-form">
+        <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+
+        <label>Speler ID of username</label>
+        <input type="text" name="user_id" placeholder="Bijv. 1 of Esosa" required>
+
+        <label>Aantal diamanten</label>
+        <input type="number" name="amount" min="1" required>
+
+        <label>Reden (voor logboek)</label>
+        <input type="text" name="reason" placeholder="Waarom geef je diamanten?">
+
+        <div class="admin-actions-row">
+            <button type="submit" name="action" value="add" class="btn btn-gold">➕ Toevoegen</button>
+            <button type="submit" name="action" value="remove" class="btn btn-outline">➖ Afnemen</button>
+            <button type="submit" name="action" value="set" class="btn btn-outline">🎯 Instellen op</button>
+        </div>
+    </form>
+</section>
+
+<div class="admin-split">
+    <section class="admin-section">
+        <h2>🏆 Top diamant houders</h2>
+        <ol class="top-list">
+            <?php foreach ($top as $u): ?>
+                <li>
+                    <a href="user_edit.php?id=<?= (int)$u['id'] ?>"><?= htmlspecialchars($u['username']) ?></a>
+                    <strong style="color:#b9f2ff;"><?= number_format((int)$u['diamonds'], 0, ',', '.') ?> 💎</strong>
+                </li>
+            <?php endforeach; ?>
+        </ol>
+    </section>
+
+    <section class="admin-section">
+        <h2>📜 Recente transacties</h2>
+        <ul class="admin-log-list">
+            <?php foreach ($recent as $t): ?>
+                <li>
+                    <strong><?= htmlspecialchars($t['username']) ?></strong>
+                    <span style="color:<?= (int)$t['amount'] > 0 ? '#58e08c' : '#ff5c5c' ?>;">
+                        <?= (int)$t['amount'] > 0 ? '+' : '' ?><?= number_format((int)$t['amount'], 0, ',', '.') ?> 💎
+                    </span>
+                    <small><?= htmlspecialchars($t['description'] ?: $t['type']) ?></small>
+                    <time><?= date('d M H:i', strtotime($t['created_at'])) ?></time>
+                </li>
+            <?php endforeach; ?>
+        </ul>
+    </section>
+</div>
+
+<?php require __DIR__ . '/includes/admin_footer.php'; ?>
