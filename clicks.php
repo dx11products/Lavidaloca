@@ -1,414 +1,300 @@
 <?php
-/**
- * Vendetta — Clicks & Wapens (bulk aankoop systeem)
- */
+require_once __DIR__ . '/config/db.php';
+if (!isLoggedIn()) redirect('login.php');
 
-// ============================================================
-// CLICKS VERDIENEN
-// ============================================================
-const CLICKS_PER_CRIME_WIN   = 2;
-const CLICKS_PER_CRIME_FAIL  = 1;
-const CLICKS_PER_ATTACK_WIN  = 5;
-const CLICKS_PER_ATTACK_LOSS = 1;
-const CLICKS_PER_HEIST_WIN   = 20;
-const CLICKS_PER_HEIST_LOSS  = 5;
-const CLICKS_PER_LIKE        = 1;
+$user = currentUser($pdo);
+$rankData = getRankData((int)$user['xp'], $RANKS);
 
-// ============================================================
-// CLICKS KOPEN
-// ============================================================
-const CLICK_PRICE_EUR  = 500;
-const CLICK_PRICE_BTC  = 0.0083;
-const CLICK_MIN_BUY    = 1;
-const CLICK_MAX_BUY    = 10000;
+$stats = getClicksStats($pdo, $user['id']);
+$purchases = getClicksPurchases($pdo, $user['id'], 15);
 
-const CLICK_BULK_TIERS = [
-    100  => 0.10,
-    500  => 0.20,
-    1000 => 0.30,
-];
+$error = null;
+$success = null;
 
-// ============================================================
-// WAPEN BULK KORTING
-// ============================================================
-const WEAPON_BULK_TIERS = [
-    100  => 0.10,   // 10% korting bij 100+
-    500  => 0.20,
-    1000 => 0.30,
-    5000 => 0.40,
-];
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    $amount = (int)($_POST['amount'] ?? 0);
+    $csrf   = $_POST['csrf'] ?? '';
 
-const WEAPON_MAX_BUY = 100000; // Max per aankoop
-
-// ============================================================
-// WAPENS OPHALEN
-// ============================================================
-function getAllClickWeapons(PDO $pdo): array {
-    $stmt = $pdo->query("SELECT * FROM click_weapons ORDER BY click_cost ASC");
-    return $stmt->fetchAll();
-}
-
-function getClickWeapon(PDO $pdo, string $key): ?array {
-    $stmt = $pdo->prepare("SELECT * FROM click_weapons WHERE `key` = ? LIMIT 1");
-    $stmt->execute([$key]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
-
-/**
- * Alle wapens die user bezit (met quantity).
- */
-function getUserClickWeapons(PDO $pdo, int $userId): array {
-    $stmt = $pdo->prepare("
-        SELECT uw.*, w.name, w.description, w.icon, w.category,
-               w.click_cost, w.attack_bonus
-        FROM user_click_weapons uw
-        JOIN click_weapons w ON w.`key` = uw.weapon_key
-        WHERE uw.user_id = ? AND uw.quantity > 0
-        ORDER BY w.attack_bonus DESC
-    ");
-    $stmt->execute([$userId]);
-    return $stmt->fetchAll();
-}
-
-/**
- * Totaal aantal wapens in bezit.
- */
-function getTotalWeaponsOwned(PDO $pdo, int $userId): int {
-    $stmt = $pdo->prepare("SELECT COALESCE(SUM(quantity), 0) FROM user_click_weapons WHERE user_id = ?");
-    $stmt->execute([$userId]);
-    return (int)$stmt->fetchColumn();
-}
-
-/**
- * Aantal van een specifiek wapen dat user bezit.
- */
-function getUserWeaponQuantity(PDO $pdo, int $userId, string $weaponKey): int {
-    $stmt = $pdo->prepare("SELECT quantity FROM user_click_weapons WHERE user_id = ? AND weapon_key = ? LIMIT 1");
-    $stmt->execute([$userId, $weaponKey]);
-    return (int)($stmt->fetchColumn() ?: 0);
-}
-
-/**
- * Totale aanvalskracht uit ALLE wapens in bezit (quantity × attack_bonus).
- */
-function getClickWeaponBonus(PDO $pdo, int $userId): int {
-    $stmt = $pdo->prepare("
-        SELECT COALESCE(SUM(uw.quantity * w.attack_bonus), 0)
-        FROM user_click_weapons uw
-        JOIN click_weapons w ON w.`key` = uw.weapon_key
-        WHERE uw.user_id = ?
-    ");
-    $stmt->execute([$userId]);
-    return (int)$stmt->fetchColumn();
-}
-
-/**
- * Uitgerust wapen (voor weergave) — het sterkste wapen.
- */
-function getEquippedClickWeapon(PDO $pdo, int $userId): ?array {
-    $stmt = $pdo->prepare("
-        SELECT uw.*, w.name, w.icon, w.attack_bonus, w.category
-        FROM user_click_weapons uw
-        JOIN click_weapons w ON w.`key` = uw.weapon_key
-        WHERE uw.user_id = ? AND uw.quantity > 0
-        ORDER BY w.attack_bonus DESC
-        LIMIT 1
-    ");
-    $stmt->execute([$userId]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
-
-/**
- * Top-3 wapens (voor weergave).
- */
-function getTopWeapons(PDO $pdo, int $userId, int $limit = 3): array {
-    $stmt = $pdo->prepare("
-        SELECT uw.quantity, w.name, w.icon, w.attack_bonus, w.category
-        FROM user_click_weapons uw
-        JOIN click_weapons w ON w.`key` = uw.weapon_key
-        WHERE uw.user_id = ? AND uw.quantity > 0
-        ORDER BY (uw.quantity * w.attack_bonus) DESC
-        LIMIT ?
-    ");
-    $stmt->bindValue(1, $userId, PDO::PARAM_INT);
-    $stmt->bindValue(2, $limit, PDO::PARAM_INT);
-    $stmt->execute();
-    return $stmt->fetchAll();
-}
-
-// ============================================================
-// BULK KOPEN
-// ============================================================
-/**
- * Bereken prijs voor X wapens met bulk korting.
- */
-function calculateWeaponPrice(int $quantity, int $unitPrice): array {
-    $subtotal = $quantity * $unitPrice;
-
-    $discountPct = 0;
-    foreach (WEAPON_BULK_TIERS as $threshold => $pct) {
-        if ($quantity >= $threshold) $discountPct = $pct;
-    }
-
-    $discountAmount = $subtotal * $discountPct;
-    $total = $subtotal - $discountAmount;
-
-    return [
-        'unit'            => $unitPrice,
-        'subtotal'        => (int)$subtotal,
-        'discount_pct'    => $discountPct,
-        'discount_amount' => (int)round($discountAmount),
-        'total'           => (int)ceil($total),
-        'quantity'        => $quantity,
-    ];
-}
-
-/**
- * Koop X wapens.
- */
-function buyWeaponBulk(PDO $pdo, int $userId, string $weaponKey, int $quantity): array {
-    if ($quantity < 1) {
-        return ['error' => 'Ongeldig aantal.'];
-    }
-    if ($quantity > WEAPON_MAX_BUY) {
-        return ['error' => 'Maximum ' . number_format(WEAPON_MAX_BUY, 0, ',', '.') . ' per aankoop.'];
-    }
-
-    $weapon = getClickWeapon($pdo, $weaponKey);
-    if (!$weapon) {
-        return ['error' => 'Wapen niet gevonden.'];
-    }
-
-    // Rank check
-    $stmt = $pdo->prepare("SELECT xp, clicks FROM users WHERE id = ?");
-    $stmt->execute([$userId]);
-    $row = $stmt->fetch();
-    $xp = (int)$row['xp'];
-    $clicks = (int)$row['clicks'];
-
-    $rankData = getRankData($xp, getRanksArray());
-    if ($rankData['level'] < (int)$weapon['min_rank']) {
-        return ['error' => 'Je rank is te laag voor dit wapen.'];
-    }
-
-    // Prijs berekenen
-    $price = calculateWeaponPrice($quantity, (int)$weapon['click_cost']);
-    $totalCost = $price['total'];
-
-    if ($clicks < $totalCost) {
-        $tekort = $totalCost - $clicks;
-        return ['error' => 'Je hebt ' . number_format($tekort, 0, ',', '.') . ' clicks tekort.'];
-    }
-
-    $pdo->beginTransaction();
-    try {
-        // Trek clicks af
-        $pdo->prepare("UPDATE users SET clicks = clicks - ? WHERE id = ?")
-            ->execute([$totalCost, $userId]);
-
-        // Voeg wapens toe
-        $stmt = $pdo->prepare("SELECT id, quantity FROM user_click_weapons WHERE user_id = ? AND weapon_key = ? LIMIT 1");
-        $stmt->execute([$userId, $weaponKey]);
-        $existing = $stmt->fetch();
-
-        if ($existing) {
-            $pdo->prepare("UPDATE user_click_weapons SET quantity = quantity + ? WHERE id = ?")
-                ->execute([$quantity, $existing['id']]);
+    if (!hash_equals(csrf_token(), $csrf)) {
+        $error = 'Ongeldige sessie.';
+    } elseif ($amount <= 0) {
+        $error = 'Voer een geldig aantal in.';
+    } elseif ($action === 'buy_eur') {
+        $res = buyClicksWithEur($pdo, $user['id'], $amount);
+        if (isset($res['error'])) {
+            $error = $res['error'];
         } else {
-            $pdo->prepare("INSERT INTO user_click_weapons (user_id, weapon_key, quantity) VALUES (?, ?, ?)")
-                ->execute([$userId, $weaponKey, $quantity]);
+            $success = "🖱️ Je hebt {$res['amount']} clicks gekocht voor €" . number_format($res['total'], 0, ',', '.') . "!";
+            $user = currentUser($pdo);
+            $stats = getClicksStats($pdo, $user['id']);
+            $purchases = getClicksPurchases($pdo, $user['id'], 15);
         }
-
-        if (function_exists('logActivity')) {
-            logActivity($pdo, $userId,
-                "🔫 {$quantity}x {$weapon['name']} gekocht voor " . number_format($totalCost, 0, ',', '.') . " clicks");
+    } elseif ($action === 'buy_btc') {
+        $res = buyClicksWithBtc($pdo, $user['id'], $amount);
+        if (isset($res['error'])) {
+            $error = $res['error'];
+        } else {
+            $success = "🖱️ Je hebt {$res['amount']} clicks gekocht voor ₿" . formatBtc($res['total']) . "!";
+            $user = currentUser($pdo);
+            $stats = getClicksStats($pdo, $user['id']);
+            $purchases = getClicksPurchases($pdo, $user['id'], 15);
         }
-
-        $pdo->commit();
-
-        return [
-            'success'  => true,
-            'quantity' => $quantity,
-            'cost'     => $totalCost,
-            'weapon'   => $weapon['name'],
-        ];
-    } catch (Exception $e) {
-        $pdo->rollBack();
-        return ['error' => 'Aankoop mislukt: ' . $e->getMessage()];
     }
 }
 
-// ============================================================
-// CLICKS BIJSCHRIJVEN
-// ============================================================
-function addClicks(PDO $pdo, int $userId, int $amount, string $reason = 'reward'): void {
-    if ($amount <= 0) return;
-
-    $pdo->prepare("
-        UPDATE users
-        SET clicks = clicks + ?, total_clicks_earned = total_clicks_earned + ?
-        WHERE id = ?
-    ")->execute([$amount, $amount, $userId]);
-
-    try {
-        $pdo->prepare("
-            INSERT INTO clicks_purchases (user_id, amount, method, description)
-            VALUES (?, ?, 'reward', ?)
-        ")->execute([$userId, $amount, $reason]);
-    } catch (Exception $e) {}
-}
-
-// ============================================================
-// CLICKS KOPEN (geld/BTC)
-// ============================================================
-function calculateClickPrice(int $amount, string $method = 'eur'): array {
-    $unit = $method === 'eur' ? CLICK_PRICE_EUR : CLICK_PRICE_BTC;
-    $subtotal = $amount * $unit;
-
-    $discountPct = 0;
-    foreach (CLICK_BULK_TIERS as $threshold => $pct) {
-        if ($amount >= $threshold) $discountPct = $pct;
-    }
-
-    $discountAmount = $subtotal * $discountPct;
-    $total = $subtotal - $discountAmount;
-
-    return [
-        'unit'            => $unit,
-        'subtotal'        => $subtotal,
-        'discount_pct'    => $discountPct,
-        'discount_amount' => $discountAmount,
-        'total'           => $total,
-        'amount'          => $amount,
+// Prijzen voor quick-buy
+$quickAmounts = [10, 50, 100, 500];
+$quickPrices = [];
+foreach ($quickAmounts as $q) {
+    $quickPrices[$q] = [
+        'eur' => calculateClickPrice($q, 'eur'),
+        'btc' => calculateClickPrice($q, 'btc'),
     ];
 }
 
-function buyClicksWithEur(PDO $pdo, int $userId, int $amount): array {
-    if ($amount < CLICK_MIN_BUY) return ['error' => 'Minimum ' . CLICK_MIN_BUY . ' click'];
-    if ($amount > CLICK_MAX_BUY) return ['error' => 'Maximum ' . CLICK_MAX_BUY . ' clicks per keer'];
+$pageTitle = 'Clicks kopen — Vendetta';
+require __DIR__ . '/includes/header.php';
+?>
 
-    $price = calculateClickPrice($amount, 'eur');
-    $totalEur = (int)ceil($price['total']);
+<div class="page-header">
+    <h1>Clicks <span>kopen</span></h1>
+    <p>Wapens worden alleen met clicks gekocht. Clicks kun je verdienen, of kopen met geld of BTC.</p>
+</div>
 
-    $stmt = $pdo->prepare("SELECT money FROM users WHERE id = ?");
-    $stmt->execute([$userId]);
-    $money = (int)$stmt->fetchColumn();
+<?php if ($error): ?>
+    <div class="alert alert-error"><?= htmlspecialchars($error) ?></div>
+<?php endif; ?>
+<?php if ($success): ?>
+    <div class="alert alert-success">✅ <?= htmlspecialchars($success) ?></div>
+<?php endif; ?>
 
-    if ($money < $totalEur) {
-        return ['error' => 'Je hebt niet genoeg geld. Je hebt €' . number_format($totalEur - $money, 0, ',', '.') . ' tekort.'];
+<!-- Balans -->
+<div class="clicks-hero">
+    <div class="clicks-balance">
+        <span class="clicks-icon">🖱️</span>
+        <span class="clicks-amount"><?= number_format((int)($user['clicks'] ?? 0), 0, ',', '.') ?></span>
+        <span class="clicks-label">clicks</span>
+    </div>
+    <div class="clicks-sub">
+        Besteedbaar aan wapens en uitrusting
+    </div>
+</div>
+
+<!-- Stats -->
+<div class="stat-grid">
+    <div class="stat-card">
+        <div class="stat-icon">💰</div>
+        <div class="stat-value gold">€<?= number_format($user['money'], 0, ',', '.') ?></div>
+        <div class="stat-label">Cash beschikbaar</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">₿</div>
+        <div class="stat-value" style="color:#f7931a;"><?= formatBtc((float)($user['btc'] ?? 0)) ?></div>
+        <div class="stat-label">BTC beschikbaar</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">📈</div>
+        <div class="stat-value"><?= number_format($stats['clicks_earned'], 0, ',', '.') ?></div>
+        <div class="stat-label">Clicks verdiend</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">🛒</div>
+        <div class="stat-value"><?= number_format($stats['clicks_bought_eur'] + $stats['clicks_bought_btc'], 0, ',', '.') ?></div>
+        <div class="stat-label">Clicks gekocht</div>
+    </div>
+</div>
+
+<!-- Quick buy -->
+<section class="section">
+    <h2>⚡ Snel kopen</h2>
+    <p class="muted">
+        1 click = €<?= number_format(CLICK_PRICE_EUR, 0, ',', '.') ?> of ₿<?= formatBtc(CLICK_PRICE_BTC) ?>
+        · Bulk korting: 10% bij 100+, 20% bij 500+, 30% bij 1.000+
+    </p>
+
+    <div class="quick-buy-grid">
+        <?php foreach ($quickAmounts as $amount):
+            $eurPrice = $quickPrices[$amount]['eur'];
+            $btcPrice = $quickPrices[$amount]['btc'];
+            $eurTotal = (int)ceil($eurPrice['total']);
+            $btcTotal = round($btcPrice['total'], 8);
+            $canEur = $user['money'] >= $eurTotal;
+            $canBtc = (float)($user['btc'] ?? 0) >= $btcTotal;
+        ?>
+            <div class="quick-buy-card">
+                <div class="quick-amount">
+                    <strong><?= number_format($amount, 0, ',', '.') ?></strong>
+                    <span>clicks</span>
+                </div>
+
+                <?php if ($eurPrice['discount_pct'] > 0): ?>
+                    <div class="quick-discount">
+                        -<?= (int)($eurPrice['discount_pct'] * 100) ?>% korting
+                    </div>
+                <?php endif; ?>
+
+                <div class="quick-prices">
+                    <div class="quick-price-row">
+                        <span>€ Prijs</span>
+                        <strong>€<?= number_format($eurTotal, 0, ',', '.') ?></strong>
+                    </div>
+                    <div class="quick-price-row">
+                        <span>₿ Prijs</span>
+                        <strong style="color:#f7931a;">₿<?= formatBtc($btcTotal) ?></strong>
+                    </div>
+                </div>
+
+                <form method="POST" class="quick-buy-actions">
+                    <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+                    <input type="hidden" name="amount" value="<?= $amount ?>">
+                    <button type="submit" name="action" value="buy_eur" class="btn btn-gold"
+                            <?= !$canEur ? 'disabled' : '' ?>>
+                        €<?= number_format($eurTotal, 0, ',', '.') ?>
+                    </button>
+                    <button type="submit" name="action" value="buy_btc" class="btn btn-outline btc-btn"
+                            <?= !$canBtc ? 'disabled' : '' ?>>
+                        ₿<?= formatBtc($btcTotal) ?>
+                    </button>
+                </form>
+            </div>
+        <?php endforeach; ?>
+    </div>
+</section>
+
+<!-- Custom buy -->
+<section class="section">
+    <h2>🎯 Eigen aantal</h2>
+    <div class="clicks-shop-grid">
+        <!-- EUR -->
+        <div class="clicks-shop-card">
+            <div class="shop-head">
+                <span class="shop-icon">💵</span>
+                <h3>Koop met geld</h3>
+            </div>
+            <p class="muted">Betaal met euro's uit je cash.</p>
+
+            <form method="POST" class="custom-buy-form">
+                <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+                <input type="hidden" name="action" value="buy_eur">
+
+                <div class="bet-input">
+                    <label>Aantal clicks (max <?= number_format(CLICK_MAX_BUY, 0, ',', '.') ?>)</label>
+                    <input type="number" name="amount" min="<?= CLICK_MIN_BUY ?>"
+                           max="<?= CLICK_MAX_BUY ?>" value="10" required
+                           oninput="updatePricePreview(this, 'eur')">
+                </div>
+
+                <div class="price-preview" id="preview-eur">
+                    <span>Prijs:</span>
+                    <strong>€<?= number_format(CLICK_PRICE_EUR * 10, 0, ',', '.') ?></strong>
+                </div>
+
+                <button type="submit" class="btn btn-gold btn-full">Koop met geld</button>
+            </form>
+        </div>
+
+        <!-- BTC -->
+        <div class="clicks-shop-card btc">
+            <div class="shop-head">
+                <span class="shop-icon">₿</span>
+                <h3>Koop met Bitcoin</h3>
+            </div>
+            <p class="muted">Betaal met BTC uit je wallet.</p>
+
+            <form method="POST" class="custom-buy-form">
+                <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+                <input type="hidden" name="action" value="buy_btc">
+
+                <div class="bet-input">
+                    <label>Aantal clicks (max <?= number_format(CLICK_MAX_BUY, 0, ',', '.') ?>)</label>
+                    <input type="number" name="amount" min="<?= CLICK_MIN_BUY ?>"
+                           max="<?= CLICK_MAX_BUY ?>" value="10" required
+                           oninput="updatePricePreview(this, 'btc')">
+                </div>
+
+                <div class="price-preview" id="preview-btc">
+                    <span>Prijs:</span>
+                    <strong style="color:#f7931a;">₿<?= formatBtc(CLICK_PRICE_BTC * 10) ?></strong>
+                </div>
+
+                <button type="submit" class="btn btn-gold btn-full btc-btn">Koop met BTC</button>
+            </form>
+        </div>
+    </div>
+</section>
+
+<!-- Geschiedenis -->
+<?php if (!empty($purchases)): ?>
+<section class="section">
+    <h2>📜 Clicks geschiedenis</h2>
+    <ul class="activity-list">
+        <?php foreach ($purchases as $p): ?>
+            <li>
+                <span>
+                    <?php if ($p['method'] === 'eur'): ?>
+                        💵 <strong>+<?= number_format((int)$p['amount'], 0, ',', '.') ?></strong> clicks
+                        — betaald: €<?= number_format((int)$p['paid_eur'], 0, ',', '.') ?>
+                    <?php elseif ($p['method'] === 'btc'): ?>
+                        ₿ <strong>+<?= number_format((int)$p['amount'], 0, ',', '.') ?></strong> clicks
+                        — betaald: ₿<?= formatBtc((float)$p['paid_btc']) ?>
+                    <?php else: ?>
+                        🎁 <strong>+<?= number_format((int)$p['amount'], 0, ',', '.') ?></strong> clicks
+                        — <?= htmlspecialchars($p['description'] ?? 'Beloning') ?>
+                    <?php endif; ?>
+                </span>
+                <time><?= date('d M H:i', strtotime($p['created_at'])) ?></time>
+            </li>
+        <?php endforeach; ?>
+    </ul>
+</section>
+<?php endif; ?>
+
+<!-- Info -->
+<section class="section">
+    <div class="tip-card">
+        <p>💡 <strong>Tip:</strong> Clicks kunnen <strong>niet verkocht</strong> worden.
+        Besteed ze aan wapens in <a href="weapons.php">Wapens</a> om je aanvalskracht te verhogen.
+        Verdien gratis clicks via kluizen, crimes, gevechten en likes.</p>
+    </div>
+</section>
+
+<script>
+function updatePricePreview(input, method) {
+    const amount = parseInt(input.value) || 0;
+    const preview = document.getElementById('preview-' + method);
+    if (!preview) return;
+
+    const unit = method === 'eur' ? <?= CLICK_PRICE_EUR ?> : <?= CLICK_PRICE_BTC ?>;
+
+    // Bulk korting
+    let discount = 0;
+    <?php foreach (CLICK_BULK_TIERS as $threshold => $pct): ?>
+    if (amount >= <?= $threshold ?>) discount = <?= $pct ?>;
+    <?php endforeach; ?>
+
+    const total = amount * unit * (1 - discount);
+    const strong = preview.querySelector('strong');
+
+    if (method === 'eur') {
+        strong.textContent = '€' + Math.ceil(total).toLocaleString('nl-NL');
+    } else {
+        strong.textContent = '₿' + total.toFixed(8).replace(/\.?0+$/, '') || '0';
     }
 
-    $pdo->beginTransaction();
-    try {
-        $pdo->prepare("UPDATE users SET money = money - ?, clicks = clicks + ? WHERE id = ?")
-            ->execute([$totalEur, $amount, $userId]);
-
-        $pdo->prepare("
-            INSERT INTO clicks_purchases (user_id, amount, paid_eur, method, description)
-            VALUES (?, ?, ?, 'eur', ?)
-        ")->execute([$userId, $amount, $totalEur, "Aankoop {$amount} clicks met geld"]);
-
-        if (function_exists('logActivity')) {
-            logActivity($pdo, $userId, "🖱️ {$amount} clicks gekocht voor €" . number_format($totalEur, 0, ',', '.'));
+    // Toon korting
+    let discountEl = preview.querySelector('.discount-tag');
+    if (discount > 0) {
+        if (!discountEl) {
+            discountEl = document.createElement('small');
+            discountEl.className = 'discount-tag';
+            preview.appendChild(discountEl);
         }
-        $pdo->commit();
-
-        return ['success' => true, 'amount' => $amount, 'total' => $totalEur];
-    } catch (Exception $e) {
-        $pdo->rollBack();
-        return ['error' => 'Aankoop mislukt.'];
+        discountEl.textContent = '-' + (discount * 100) + '% korting!';
+    } else if (discountEl) {
+        discountEl.remove();
     }
 }
+</script>
 
-function buyClicksWithBtc(PDO $pdo, int $userId, int $amount): array {
-    if ($amount < CLICK_MIN_BUY) return ['error' => 'Minimum ' . CLICK_MIN_BUY . ' click'];
-    if ($amount > CLICK_MAX_BUY) return ['error' => 'Maximum ' . CLICK_MAX_BUY . ' clicks per keer'];
-
-    $price = calculateClickPrice($amount, 'btc');
-    $totalBtc = round($price['total'], 8);
-
-    $stmt = $pdo->prepare("SELECT btc FROM users WHERE id = ?");
-    $stmt->execute([$userId]);
-    $btc = (float)$stmt->fetchColumn();
-
-    if ($btc < $totalBtc) {
-        $btcFormatted = function_exists('formatBtc') ? formatBtc($totalBtc - $btc) : ($totalBtc - $btc);
-        return ['error' => 'Je hebt niet genoeg BTC. Je hebt ₿' . $btcFormatted . ' tekort.'];
-    }
-
-    $pdo->beginTransaction();
-    try {
-        $pdo->prepare("UPDATE users SET btc = btc - ?, clicks = clicks + ? WHERE id = ?")
-            ->execute([$totalBtc, $amount, $userId]);
-
-        $pdo->prepare("
-            INSERT INTO clicks_purchases (user_id, amount, paid_btc, method, description)
-            VALUES (?, ?, ?, 'btc', ?)
-        ")->execute([$userId, $amount, $totalBtc, "Aankoop {$amount} clicks met BTC"]);
-
-        if (function_exists('logActivity')) {
-            $btcFormatted = function_exists('formatBtc') ? formatBtc($totalBtc) : $totalBtc;
-            logActivity($pdo, $userId, "🖱️ {$amount} clicks gekocht voor ₿" . $btcFormatted);
-        }
-        $pdo->commit();
-
-        return ['success' => true, 'amount' => $amount, 'total' => $totalBtc];
-    } catch (Exception $e) {
-        $pdo->rollBack();
-        return ['error' => 'Aankoop mislukt.'];
-    }
-}
-
-// ============================================================
-// STATS
-// ============================================================
-function getClicksPurchases(PDO $pdo, int $userId, int $limit = 15): array {
-    $stmt = $pdo->prepare("
-        SELECT * FROM clicks_purchases
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-    ");
-    $stmt->bindValue(1, $userId, PDO::PARAM_INT);
-    $stmt->bindValue(2, $limit, PDO::PARAM_INT);
-    $stmt->execute();
-    return $stmt->fetchAll();
-}
-
-function getClicksStats(PDO $pdo, int $userId): array {
-    $stats = [
-        'clicks_bought_eur' => 0,
-        'clicks_bought_btc' => 0,
-        'clicks_earned'     => 0,
-        'eur_spent'         => 0,
-        'btc_spent'         => 0,
-    ];
-
-    try {
-        $stmt = $pdo->prepare("
-            SELECT
-                COALESCE(SUM(CASE WHEN method = 'eur' THEN amount ELSE 0 END), 0) AS clicks_bought_eur,
-                COALESCE(SUM(CASE WHEN method = 'btc' THEN amount ELSE 0 END), 0) AS clicks_bought_btc,
-                COALESCE(SUM(CASE WHEN method = 'reward' THEN amount ELSE 0 END), 0) AS clicks_earned,
-                COALESCE(SUM(paid_eur), 0) AS eur_spent,
-                COALESCE(SUM(paid_btc), 0) AS btc_spent
-            FROM clicks_purchases
-            WHERE user_id = ?
-        ");
-        $stmt->execute([$userId]);
-        $row = $stmt->fetch();
-        if ($row) {
-            $stats = [
-                'clicks_bought_eur' => (int)$row['clicks_bought_eur'],
-                'clicks_bought_btc' => (int)$row['clicks_bought_btc'],
-                'clicks_earned'     => (int)$row['clicks_earned'],
-                'eur_spent'         => (int)$row['eur_spent'],
-                'btc_spent'         => (float)$row['btc_spent'],
-            ];
-        }
-    } catch (Exception $e) {}
-
-    return $stats;
-}
+<?php require __DIR__ . '/includes/footer.php'; ?>

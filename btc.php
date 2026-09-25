@@ -1,205 +1,241 @@
 <?php
-/**
- * Vendetta — Bitcoin & Miners
- * BELANGRIJK: Alleen functies en constanten.
- */
+require_once __DIR__ . '/config/db.php';
+if (!isLoggedIn()) redirect('login.php');
 
-// ============================================================
-// INSTELLINGEN
-// ============================================================
-const BTC_SELL_RATE         = 60000;
-const BTC_MAX_LEVEL         = 10;
-const BTC_UPGRADE_MULTIPLIER = 1.80;   // Kosten vermenigvuldigen per level
-const BTC_LEVEL_BONUS       = 1.00;    // +100% per level (verdubbelt!)
+$user = currentUser($pdo);
 
-// ============================================================
-// MINERS OPHALEN
-// ============================================================
-function getAllBtcMiners(PDO $pdo): array {
-    $stmt = $pdo->query("SELECT * FROM btc_miners ORDER BY tier ASC");
-    return $stmt->fetchAll();
+$miners = getUserMiners($pdo, $user['id']);
+$transactions = getBtcTransactions($pdo, $user['id'], 15);
+
+// Bereken totale uur/dag opbrengst
+$totalHourly = 0;
+$totalDaily = 0;
+foreach ($miners as $m) {
+    $totalHourly += minerHourlyRate($m);
+    $totalDaily  += minerDailyRate($m);
 }
 
-function getBtcMiner(PDO $pdo, string $key): ?array {
-    $stmt = $pdo->prepare("SELECT * FROM btc_miners WHERE `key` = ? LIMIT 1");
-    $stmt->execute([$key]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
+$error = null;
+$success = null;
 
-// ============================================================
-// USER MINERS
-// ============================================================
-function getMinerForHouse(PDO $pdo, int $houseId): ?array {
-    $stmt = $pdo->prepare("
-        SELECT um.*, m.name, m.icon, m.base_btc_per_hour, m.tier, m.base_price, m.description
-        FROM user_btc_miners um
-        JOIN btc_miners m ON m.`key` = um.miner_key
-        WHERE um.house_id = ?
-        LIMIT 1
-    ");
-    $stmt->execute([$houseId]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    $csrf = $_POST['csrf'] ?? '';
 
-function getUserMiners(PDO $pdo, int $userId): array {
-    $stmt = $pdo->prepare("
-        SELECT um.*, m.name, m.icon, m.base_btc_per_hour, m.tier, m.base_price, m.description,
-               h.name AS house_name, uh.country_key
-        FROM user_btc_miners um
-        JOIN btc_miners m ON m.`key` = um.miner_key
-        JOIN user_houses uh ON uh.id = um.house_id
-        JOIN houses h ON h.`key` = uh.house_key
-        WHERE um.user_id = ?
-        ORDER BY um.total_btc_mined DESC
-    ");
-    $stmt->execute([$userId]);
-    return $stmt->fetchAll();
-}
+    if (!hash_equals(csrf_token(), $csrf)) {
+        $error = 'Ongeldige sessie.';
+    } elseif ($action === 'sell') {
+        $amount = (float)($_POST['amount'] ?? 0);
+        $btc = (float)$user['btc'];
 
-// ============================================================
-// PRODUCTIE BEREKENEN
-// ============================================================
-/**
- * BTC per uur voor een miner op bepaald level.
- * Elke level verdubbelt de opbrengst (+100%).
- *
- * Level 1  = ×1
- * Level 3  = ×4
- * Level 5  = ×16
- * Level 7  = ×64
- * Level 10 = ×512
- */
-function minerHourlyRate(array $miner): float {
-    $base  = (float)$miner['base_btc_per_hour'];
-    $level = max(1, (int)$miner['level']);
+        if ($amount <= 0 || $amount > $btc) {
+            $error = 'Ongeldig bedrag.';
+        } else {
+            $eur = btcToEur($amount);
 
-    // Verdubbel per level: 2^(level-1)
-    $multiplier = pow(2, $level - 1);
+            $pdo->beginTransaction();
+            try {
+                $pdo->prepare("UPDATE users SET btc = btc - ?, money = money + ?, total_btc_sold = total_btc_sold + ? WHERE id = ?")
+                    ->execute([$amount, $eur, $amount, $user['id']]);
 
-    return $base * $multiplier;
-}
+                addBtcTransaction($pdo, $user['id'], -$amount, 'sell', 'Verkocht voor €' . number_format($eur, 0, ',', '.'));
+                logActivity($pdo, $user['id'], "₿ " . formatBtc($amount) . " BTC verkocht voor €" . number_format($eur, 0, ',', '.'));
+                $pdo->commit();
 
-/**
- * BTC per dag voor een miner.
- */
-function minerDailyRate(array $miner): float {
-    return minerHourlyRate($miner) * 24;
-}
+                $success = "₿ " . formatBtc($amount) . " BTC verkocht voor €" . number_format($eur, 0, ',', '.');
+                $user = currentUser($pdo);
+                $transactions = getBtcTransactions($pdo, $user['id'], 15);
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                $error = 'Verkoop mislukt.';
+            }
+        }
+    } elseif ($action === 'sell_all') {
+        $btc = (float)$user['btc'];
+        if ($btc <= 0) {
+            $error = 'Je hebt geen BTC.';
+        } else {
+            $eur = btcToEur($btc);
 
-/**
- * BTC per week voor een miner.
- */
-function minerWeeklyRate(array $miner): float {
-    return minerHourlyRate($miner) * 24 * 7;
-}
+            $pdo->beginTransaction();
+            try {
+                $pdo->prepare("UPDATE users SET btc = 0, money = money + ?, total_btc_sold = total_btc_sold + ? WHERE id = ?")
+                    ->execute([$eur, $btc, $user['id']]);
 
-/**
- * BTC per maand voor een miner (30 dagen).
- */
-function minerMonthlyRate(array $miner): float {
-    return minerHourlyRate($miner) * 24 * 30;
-}
+                addBtcTransaction($pdo, $user['id'], -$btc, 'sell', 'Alles verkocht voor €' . number_format($eur, 0, ',', '.'));
+                logActivity($pdo, $user['id'], "₿ " . formatBtc($btc) . " BTC verkocht voor €" . number_format($eur, 0, ',', '.'));
+                $pdo->commit();
 
-/**
- * Multiplier voor weergave.
- */
-function minerLevelMultiplier(int $level): int {
-    return (int)pow(2, max(1, $level) - 1);
-}
-
-/**
- * Update alle miners van user — accumuleer productie sinds last_production_at.
- */
-function updateUserBtcProduction(PDO $pdo, int $userId): float {
-    $stmt = $pdo->prepare("
-        SELECT um.id, um.level, um.last_production_at,
-               m.base_btc_per_hour
-        FROM user_btc_miners um
-        JOIN btc_miners m ON m.`key` = um.miner_key
-        WHERE um.user_id = ?
-    ");
-    $stmt->execute([$userId]);
-    $miners = $stmt->fetchAll();
-
-    if (empty($miners)) return 0.0;
-
-    $totalGained = 0.0;
-    $now = time();
-
-    foreach ($miners as $m) {
-        $last = strtotime($m['last_production_at']);
-        $seconds = $now - $last;
-        if ($seconds < 60) continue;
-
-        $hours = $seconds / 3600;
-        $multiplier = pow(2, max(1, (int)$m['level']) - 1);
-        $rate = (float)$m['base_btc_per_hour'] * $multiplier;
-        $gained = $rate * $hours;
-
-        if ($gained <= 0) continue;
-
-        $totalGained += $gained;
-
-        $pdo->prepare("
-            UPDATE user_btc_miners
-            SET last_production_at = NOW(),
-                total_btc_mined = total_btc_mined + ?
-            WHERE id = ?
-        ")->execute([$gained, $m['id']]);
+                $success = "₿ " . formatBtc($btc) . " BTC verkocht voor €" . number_format($eur, 0, ',', '.');
+                $user = currentUser($pdo);
+                $transactions = getBtcTransactions($pdo, $user['id'], 15);
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                $error = 'Verkoop mislukt.';
+            }
+        }
     }
-
-    if ($totalGained > 0) {
-        $pdo->prepare("
-            UPDATE users
-            SET btc = btc + ?, total_btc_earned = total_btc_earned + ?
-            WHERE id = ?
-        ")->execute([$totalGained, $totalGained, $userId]);
-    }
-
-    return $totalGained;
 }
 
-// ============================================================
-// KOPEN & UPGRADEN
-// ============================================================
-function getUpgradeCost(array $miner): int {
-    $base = (int)$miner['base_price'];
-    $level = max(1, (int)$miner['level']);
-    return (int)round($base * 0.8 * pow(BTC_UPGRADE_MULTIPLIER, $level));
-}
+$pageTitle = 'Bitcoin — Vendetta';
+require __DIR__ . '/includes/header.php';
+?>
 
-function addBtcTransaction(PDO $pdo, int $userId, float $amount, string $type, string $description): void {
-    $pdo->prepare("
-        INSERT INTO btc_transactions (user_id, amount, type, description)
-        VALUES (?, ?, ?, ?)
-    ")->execute([$userId, $amount, $type, $description]);
-}
+<div class="page-header">
+    <h1>₿ <span>Bitcoin</span></h1>
+    <p>Verdien BTC via kluizen en mining. Verkoop voor euro's op de markt.</p>
+</div>
 
-function getBtcTransactions(PDO $pdo, int $userId, int $limit = 20): array {
-    $stmt = $pdo->prepare("
-        SELECT * FROM btc_transactions
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-    ");
-    $stmt->bindValue(1, $userId, PDO::PARAM_INT);
-    $stmt->bindValue(2, $limit, PDO::PARAM_INT);
-    $stmt->execute();
-    return $stmt->fetchAll();
-}
+<?php if ($error): ?>
+    <div class="alert alert-error"><?= htmlspecialchars($error) ?></div>
+<?php endif; ?>
+<?php if ($success): ?>
+    <div class="alert alert-success">✅ <?= htmlspecialchars($success) ?></div>
+<?php endif; ?>
 
-// ============================================================
-// FORMATTEREN
-// ============================================================
-function formatBtc(float $amount): string {
-    $str = number_format($amount, 8, '.', '');
-    $str = rtrim(rtrim($str, '0'), '.');
-    if ($str === '' || $str === '-') $str = '0';
-    return $str;
-}
+<!-- Balans -->
+<div class="btc-hero">
+    <div class="btc-hero-amount">
+        <span class="btc-icon">₿</span>
+        <span class="btc-balance"><?= formatBtc((float)$user['btc']) ?></span>
+        <span class="btc-label">BTC</span>
+    </div>
+    <div class="btc-hero-eur">
+        ≈ €<?= number_format(btcToEur((float)$user['btc']), 0, ',', '.') ?>
+    </div>
+    <div class="btc-hero-rate">
+        1 BTC = €<?= number_format(BTC_SELL_RATE, 0, ',', '.') ?>
+    </div>
+</div>
 
-function btcToEur(float $btc): int {
-    return (int)floor($btc * BTC_SELL_RATE);
-}
+<!-- Stats -->
+<div class="stat-grid">
+    <div class="stat-card">
+        <div class="stat-icon">📈</div>
+        <div class="stat-value" style="color:#f7931a;"><?= formatBtc($totalHourly) ?></div>
+        <div class="stat-label">BTC per uur</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">📅</div>
+        <div class="stat-value" style="color:#f7931a;"><?= formatBtc($totalDaily) ?></div>
+        <div class="stat-label">BTC per dag</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">💎</div>
+        <div class="stat-value"><?= count($miners) ?></div>
+        <div class="stat-label">Miners actief</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">💰</div>
+        <div class="stat-value gold">€<?= number_format($user['money'], 0, ',', '.') ?></div>
+        <div class="stat-label">Cash</div>
+    </div>
+</div>
+
+<!-- Verkoop -->
+<?php if ((float)$user['btc'] > 0): ?>
+<section class="section">
+    <h2>💱 Verkoop BTC</h2>
+    <div class="casino-card">
+        <form method="POST" class="casino-form">
+            <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+            <input type="hidden" name="action" value="sell">
+
+            <div class="bet-input">
+                <label>Bedrag in BTC (max <?= formatBtc((float)$user['btc']) ?>)</label>
+                <input type="number" name="amount" min="0.00000001" step="0.00000001"
+                       max="<?= (float)$user['btc'] ?>"
+                       value="<?= (float)$user['btc'] ?>" required>
+            </div>
+
+            <div class="bank-actions">
+                <button type="submit" class="btn btn-gold btn-full">Verkoop</button>
+                <button type="submit" name="action" value="sell_all" class="btn btn-outline btn-full"
+                        onclick="return confirm('Alles verkopen voor €<?= number_format(btcToEur((float)$user['btc']), 0, ',', '.') ?>?');">
+                    Alles verkopen
+                </button>
+            </div>
+        </form>
+    </div>
+</section>
+<?php endif; ?>
+
+<!-- Miners -->
+<section class="section">
+    <h2>⛏️ Jouw miners (<?= count($miners) ?>)</h2>
+
+    <?php if (empty($miners)): ?>
+        <p class="muted">
+            Je hebt nog geen miners. Koop een huis en plaats een miner via
+            <a href="houses.php">Huizen</a> → bekijk je huis → Miner.
+        </p>
+    <?php else: ?>
+        <div class="miner-grid">
+            <?php foreach ($miners as $m):
+                $c = getCountry($pdo, $m['country_key']);
+            ?>
+                <div class="miner-card">
+                    <div class="miner-head">
+                        <span class="miner-icon"><?= $m['icon'] ?></span>
+                        <div>
+                            <h3><?= htmlspecialchars($m['name']) ?></h3>
+                            <small class="muted">
+                                <?= $c['flag'] ?> <?= htmlspecialchars($m['house_name']) ?>
+                            </small>
+                        </div>
+                        <span class="miner-level">Lv <?= (int)$m['level'] ?></span>
+                    </div>
+
+                    <div class="miner-stats">
+                        <div class="miner-stat">
+                            <span>📈 Per uur</span>
+                            <strong><?= formatBtc(minerHourlyRate($m)) ?> ₿</strong>
+                        </div>
+                        <div class="miner-stat">
+                            <span>📅 Per dag</span>
+                            <strong><?= formatBtc(minerDailyRate($m)) ?> ₿</strong>
+                        </div>
+                        <div class="miner-stat">
+                            <span>💎 Totaal</span>
+                            <strong><?= formatBtc((float)$m['total_btc_mined']) ?> ₿</strong>
+                        </div>
+                    </div>
+
+                    <?php if ((int)$m['level'] < BTC_MAX_LEVEL): ?>
+                        <?php $cost = getUpgradeCost($m); ?>
+                        <a href="miner.php?id=<?= (int)$m['id'] ?>" class="btn btn-gold btn-full">
+                            🔧 Upgraden — €<?= number_format($cost, 0, ',', '.') ?>
+                        </a>
+                    <?php else: ?>
+                        <button class="btn btn-outline btn-full" disabled>🏆 Max level</button>
+                    <?php endif; ?>
+                </div>
+            <?php endforeach; ?>
+        </div>
+    <?php endif; ?>
+</section>
+
+<!-- Transacties -->
+<?php if (!empty($transactions)): ?>
+<section class="section">
+    <h2>📜 BTC transacties</h2>
+    <ul class="activity-list">
+        <?php foreach ($transactions as $t):
+            $isPositive = (float)$t['amount'] > 0;
+        ?>
+            <li>
+                <span>
+                    <strong><?= htmlspecialchars($t['type']) ?></strong>
+                    — <?= htmlspecialchars($t['description']) ?>
+                    <span style="color:<?= $isPositive ? '#58e08c' : '#ff5c5c' ?>;">
+                        <?= $isPositive ? '+' : '' ?><?= formatBtc((float)$t['amount']) ?> ₿
+                    </span>
+                </span>
+                <time><?= date('d M H:i', strtotime($t['created_at'])) ?></time>
+            </li>
+        <?php endforeach; ?>
+    </ul>
+</section>
+<?php endif; ?>
+
+<?php require __DIR__ . '/includes/footer.php'; ?>

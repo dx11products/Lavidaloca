@@ -1,134 +1,200 @@
 <?php
-/**
- * Vendetta — Auto's & Garage (timer-systeem)
- */
+require_once __DIR__ . '/config/db.php';
+if (!isLoggedIn()) redirect('login.php');
 
-const CAR_STEAL_COOLDOWN  = 30;      // 30 seconden tussen steels
-const CAR_STEAL_XP        = 25;
-const CAR_SELL_PERCENT    = 70;
-const CAR_GARAGE_LIMIT    = 10;
-const CAR_LEVEL_BONUS     = 0.40;
+$user = currentUser($pdo);
+$rankData = getRankData((int)$user['xp'], $RANKS);
+$country = getCountry($pdo, $user['current_country']);
 
-function getCarLevelMultiplier(int $rankLevel): float {
-    return 1 + (($rankLevel - 1) * CAR_LEVEL_BONUS);
-}
+if (function_exists('isInPrison') && isInPrison($user)) redirect('prison.php');
 
-function getAllCarTypes(PDO $pdo): array {
-    $stmt = $pdo->query("SELECT * FROM car_types ORDER BY base_value ASC");
-    return $stmt->fetchAll();
-}
+$hasHouse = userHasHouseInCountry($pdo, $user['id'], $user['current_country']);
+$cars = getCarsInCountry($pdo, $user['current_country']);
+$myBonuses = getEquippedBonuses($pdo, $user['id']);
+$myAttack = 10 + (int)$myBonuses['attack'] + getClickWeaponBonus($pdo, $user['id']);
 
-function getCarsInCountry(PDO $pdo, string $countryKey): array {
-    $stmt = $pdo->prepare("
-        SELECT ct.*, cp.value, cp.steal_chance
-        FROM car_types ct
-        JOIN car_prices cp ON cp.car_key = ct.`key`
-        WHERE cp.country_key = ?
-        ORDER BY cp.value ASC
-    ");
-    $stmt->execute([$countryKey]);
-    return $stmt->fetchAll();
-}
+$cooldown = canStealCar($pdo, $user['id']);
+$inHospital = isInHospital($user);
 
-function getCarType(PDO $pdo, string $key): ?array {
-    $stmt = $pdo->prepare("SELECT * FROM car_types WHERE `key` = ? LIMIT 1");
-    $stmt->execute([$key]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
+$levelMult = getCarLevelMultiplier($rankData['level']);
 
-function getCarValueInCountry(PDO $pdo, string $carKey, string $countryKey): ?array {
-    $stmt = $pdo->prepare("SELECT value, steal_chance FROM car_prices WHERE car_key = ? AND country_key = ? LIMIT 1");
-    $stmt->execute([$carKey, $countryKey]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
+$result = null;
+$error  = null;
 
-function userHasHouseInCountry(PDO $pdo, int $userId, string $countryKey): bool {
-    $stmt = $pdo->prepare("SELECT id FROM user_houses WHERE user_id = ? AND country_key = ? LIMIT 1");
-    $stmt->execute([$userId, $countryKey]);
-    return (bool)$stmt->fetch();
-}
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $carKey = $_POST['car_key'] ?? '';
+    $csrf   = $_POST['csrf'] ?? '';
 
-function countGarageCars(PDO $pdo, int $userId, string $countryKey): int {
-    $stmt = $pdo->prepare("SELECT COUNT(*) FROM user_garage WHERE user_id = ? AND country_key = ?");
-    $stmt->execute([$userId, $countryKey]);
-    return (int)$stmt->fetchColumn();
-}
-
-function getUserGarage(PDO $pdo, int $userId, ?string $countryKey = null): array {
-    $sql = "
-        SELECT ug.*, ct.name, ct.brand, ct.icon, ct.rarity,
-               cp.value AS current_value,
-               c.flag, c.name AS country_name
-        FROM user_garage ug
-        JOIN car_types ct ON ct.`key` = ug.car_key
-        LEFT JOIN car_prices cp ON cp.car_key = ug.car_key AND cp.country_key = ug.country_key
-        JOIN countries c ON c.`key` = ug.country_key
-        WHERE ug.user_id = ?
-    ";
-    $params = [$userId];
-    if ($countryKey) {
-        $sql .= " AND ug.country_key = ?";
-        $params[] = $countryKey;
-    }
-    $sql .= " ORDER BY cp.value DESC, ug.stolen_at DESC";
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute($params);
-    return $stmt->fetchAll();
-}
-
-function addCarToGarage(PDO $pdo, int $userId, string $countryKey, string $carKey): void {
-    $pdo->prepare("INSERT INTO user_garage (user_id, country_key, car_key) VALUES (?, ?, ?)")
-        ->execute([$userId, $countryKey, $carKey]);
-}
-
-function getLastSteal(PDO $pdo, int $userId): ?array {
-    $stmt = $pdo->prepare("SELECT * FROM user_car_steal WHERE user_id = ? LIMIT 1");
-    $stmt->execute([$userId]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
-
-function canStealCar(PDO $pdo, int $userId): array {
-    $last = getLastSteal($pdo, $userId);
-    if (!$last) return ['ok' => true, 'wait' => 0];
-    $elapsed = time() - strtotime($last['last_steal']);
-    $wait = CAR_STEAL_COOLDOWN - $elapsed;
-    if ($wait <= 0) return ['ok' => true, 'wait' => 0];
-    return ['ok' => false, 'wait' => $wait];
-}
-
-function recordSteal(PDO $pdo, int $userId): void {
-    $stmt = $pdo->prepare("SELECT id FROM user_car_steal WHERE user_id = ? LIMIT 1");
-    $stmt->execute([$userId]);
-    if ($stmt->fetch()) {
-        $pdo->prepare("UPDATE user_car_steal SET last_steal = NOW(), total_stolen = total_stolen + 1 WHERE user_id = ?")
-            ->execute([$userId]);
+    if (!hash_equals(csrf_token(), $csrf)) {
+        $error = 'Ongeldige sessie.';
+    } elseif (!$hasHouse) {
+        $error = 'Je moet eerst een huis kopen in dit land.';
+    } elseif ($inHospital) {
+        $error = 'Je ligt in het ziekenhuis.';
+    } elseif (!$cooldown['ok']) {
+        $error = 'Wacht nog ' . $cooldown['wait'] . ' seconden.';
     } else {
-        $pdo->prepare("INSERT INTO user_car_steal (user_id, total_stolen) VALUES (?, 1)")
-            ->execute([$userId]);
+        $carInfo = getCarValueInCountry($pdo, $carKey, $user['current_country']);
+        if (!$carInfo) {
+            $error = 'Deze auto is niet beschikbaar.';
+        } elseif (countGarageCars($pdo, $user['id'], $user['current_country']) >= CAR_GARAGE_LIMIT) {
+            $error = 'Je garage is vol.';
+        } else {
+            $baseChance = (int)$carInfo['steal_chance'];
+            $attackBonus = (int)floor($myAttack / 4);
+            $chance = max(5, min(95, $baseChance + $attackBonus));
+
+            $roll = random_int(1, 100);
+            $success = $roll <= $chance;
+
+            if ($success) {
+                $pdo->beginTransaction();
+                try {
+                    $xpGain = (int)floor(CAR_STEAL_XP * $levelMult);
+                    $pdo->prepare("UPDATE users SET xp = xp + ? WHERE id = ?")->execute([$xpGain, $user['id']]);
+                    addCarToGarage($pdo, $user['id'], $user['current_country'], $carKey);
+                    recordSteal($pdo, $user['id']);
+
+                    $carType = getCarType($pdo, $carKey);
+                    logActivity($pdo, $user['id'], "🚗 {$carType['name']} gestolen in {$country['name']}");
+
+                    $pdo->commit();
+
+                    $result = ['success' => true, 'name' => $carType['name'], 'icon' => $carType['icon'], 'value' => $carInfo['value']];
+                } catch (Exception $e) {
+                    $pdo->rollBack();
+                    $error = 'Steel mislukt.';
+                }
+            } else {
+                $fine = random_int(500, 3000);
+                $fine = min($fine, (int)$user['money']);
+
+                $pdo->beginTransaction();
+                try {
+                    $pdo->prepare("UPDATE users SET money = money - ? WHERE id = ?")->execute([$fine, $user['id']]);
+                    recordSteal($pdo, $user['id']);
+
+                    $carType = getCarType($pdo, $carKey);
+                    logActivity($pdo, $user['id'], "❌ Mislukte autodiefstal ({$carType['name']}) — €" . number_format($fine, 0, ',', '.'));
+                    $pdo->commit();
+
+                    $result = ['success' => false, 'name' => $carType['name'], 'fine' => $fine];
+                } catch (Exception $e) {
+                    $pdo->rollBack();
+                    $error = 'Steel mislukt.';
+                }
+            }
+
+            $user = currentUser($pdo);
+            $cooldown = canStealCar($pdo, $user['id']);
+        }
     }
 }
 
-function rarityColor(string $rarity): string {
-    return match($rarity) {
-        'common'    => '#a08d75',
-        'uncommon'  => '#58e08c',
-        'rare'      => '#4a9dff',
-        'epic'      => '#b06aff',
-        'legendary' => '#ffb040',
-        default     => '#a08d75',
-    };
-}
+$pageTitle = 'Auto stelen — Vendetta';
+require __DIR__ . '/includes/header.php';
+?>
 
-function rarityLabel(string $rarity): string {
-    return match($rarity) {
-        'common'    => 'Gewoon',
-        'uncommon'  => 'Ongewoon',
-        'rare'      => 'Zeldzaam',
-        'epic'      => 'Episch',
-        'legendary' => 'Legendarisch',
-        default     => 'Onbekend',
-    };
-}
+<div class="page-header">
+    <h1>Auto <span>stelen</span></h1>
+    <p><?= $country['flag'] ?> <?= htmlspecialchars($country['name']) ?> — steel wagens. Wachttijd: 30 seconden na elke poging.</p>
+</div>
+
+<div class="rank-multiplier-banner">
+    <div class="rm-icon">📈</div>
+    <div class="rm-info">
+        <strong>Rank bonus: ×<?= number_format($levelMult, 2) ?></strong>
+        <p class="muted">XP schaalt mee met je rank.</p>
+    </div>
+</div>
+
+<?php if (!$hasHouse): ?>
+    <div class="alert alert-error">🏠 Je hebt geen huis in <?= htmlspecialchars($country['name']) ?>. <a href="houses.php">Koop eerst een huis →</a></div>
+<?php endif; ?>
+
+<?php if ($inHospital): ?>
+    <div class="alert alert-error">🏥 Je ligt in het ziekenhuis. <a href="hospital.php">Herstel eerst →</a></div>
+<?php endif; ?>
+
+<?php if (!$cooldown['ok'] && $hasHouse && !$inHospital): ?>
+    <div class="alert alert-error">⏱️ Wacht nog <strong><?= $cooldown['wait'] ?>s</strong> voor je weer steelt.</div>
+<?php endif; ?>
+
+<?php if ($error): ?>
+    <div class="alert alert-error"><?= htmlspecialchars($error) ?></div>
+<?php endif; ?>
+
+<?php if ($result): ?>
+    <div class="alert <?= $result['success'] ? 'alert-success' : 'alert-error' ?>">
+        <?php if ($result['success']): ?>
+            <?= $result['icon'] ?> <strong><?= htmlspecialchars($result['name']) ?></strong> gestolen! Waarde: <strong>€<?= number_format($result['value'], 0, ',', '.') ?></strong>.
+            <br>Ga naar je <a href="garage.php">garage</a> om te verkopen.
+        <?php else: ?>
+            ❌ Betrapt bij stelen van <strong><?= htmlspecialchars($result['name']) ?></strong>. Boete: €<?= number_format($result['fine'], 0, ',', '.') ?>
+        <?php endif; ?>
+    </div>
+<?php endif; ?>
+
+<div class="stat-grid">
+    <div class="stat-card">
+        <div class="stat-icon">🅿️</div>
+        <div class="stat-value"><?= countGarageCars($pdo, $user['id'], $user['current_country']) ?> / <?= CAR_GARAGE_LIMIT ?></div>
+        <div class="stat-label">Garage ruimte</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">⏱️</div>
+        <div class="stat-value">30s</div>
+        <div class="stat-label">Wachttijd</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">⚔️</div>
+        <div class="stat-value">+<?= (int)floor($myAttack / 4) ?>%</div>
+        <div class="stat-label">Bonus kans</div>
+    </div>
+</div>
+
+<section class="section">
+    <h2>Beschikbare autos in <?= htmlspecialchars($country['name']) ?></h2>
+
+    <?php if (empty($cars)): ?>
+        <p class="muted">Geen autos beschikbaar.</p>
+    <?php else: ?>
+        <div class="car-grid">
+            <?php foreach ($cars as $c):
+                $disabled = !$hasHouse || $inHospital || !$cooldown['ok']
+                            || countGarageCars($pdo, $user['id'], $user['current_country']) >= CAR_GARAGE_LIMIT;
+                $baseChance = (int)$c['steal_chance'];
+                $finalChance = max(5, min(95, $baseChance + (int)floor($myAttack / 4)));
+                $color = rarityColor($c['rarity']);
+            ?>
+            <div class="car-card <?= $disabled ? 'disabled' : '' ?> rarity-<?= $c['rarity'] ?>">
+                <div class="car-head">
+                    <span class="car-icon"><?= $c['icon'] ?></span>
+                    <div>
+                        <h3><?= htmlspecialchars($c['name']) ?></h3>
+                        <small class="car-brand"><?= htmlspecialchars($c['brand']) ?></small>
+                    </div>
+                </div>
+                <div class="car-rarity" style="color:<?= $color ?>;"><?= rarityLabel($c['rarity']) ?></div>
+                <div class="car-value">
+                    <span class="car-value-label">Waarde</span>
+                    <strong class="car-value-amount">€<?= number_format($c['value'], 0, ',', '.') ?></strong>
+                </div>
+                <div class="car-chance">
+                    <span>Kans</span>
+                    <strong class="<?= $finalChance >= 60 ? 'good' : ($finalChance >= 40 ? 'medium' : 'bad') ?>"><?= $finalChance ?>%</strong>
+                </div>
+                <form method="POST">
+                    <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+                    <input type="hidden" name="car_key" value="<?= htmlspecialchars($c['key']) ?>">
+                    <button type="submit" class="btn btn-gold btn-full" <?= $disabled ? 'disabled' : '' ?>>
+                        <?= $cooldown['ok'] ? 'Stelen' : '⏱️ ' . $cooldown['wait'] . 's' ?>
+                    </button>
+                </form>
+            </div>
+            <?php endforeach; ?>
+        </div>
+    <?php endif; ?>
+</section>
+
+<?php require __DIR__ . '/includes/footer.php'; ?>

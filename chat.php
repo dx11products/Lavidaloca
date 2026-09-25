@@ -1,202 +1,147 @@
 <?php
-/**
- * Vendetta — Chat systeem
- * BELANGRIJK: Alleen functies en constanten.
- */
+require_once __DIR__ . '/config/db.php';
+if (!isLoggedIn()) redirect('login.php');
 
-const CHAT_MSG_MAX = 300;
-const CHAT_MSG_MIN = 1;
-const CHAT_COOLDOWN_SEC = 3;
-const CHAT_ONLINE_WINDOW = 120; // 2 minuten
-const CHAT_MESSAGES_LIMIT = 50;
+$user = currentUser($pdo);
+$userFamily = getUserFamily($pdo, $user['id']);
+$onlineCount = countOnlineUsers($pdo);
 
-// ============================================================
-// BERICHTEN OPHALEN
-// ============================================================
-function getChatMessages(PDO $pdo, string $channel, ?int $familyId, int $afterId = 0): array {
-    if ($channel === 'family' && $familyId) {
-        if ($afterId > 0) {
-            $stmt = $pdo->prepare("
-                SELECT cm.*, u.username, u.xp, u.rank_title
-                FROM chat_messages cm
-                JOIN users u ON u.id = cm.user_id
-                WHERE cm.channel = 'family' AND cm.family_id = ?
-                  AND cm.id > ? AND cm.is_deleted = 0
-                ORDER BY cm.id ASC
-            ");
-            $stmt->execute([$familyId, $afterId]);
-        } else {
-            $stmt = $pdo->prepare("
-                SELECT cm.*, u.username, u.xp, u.rank_title
-                FROM chat_messages cm
-                JOIN users u ON u.id = cm.user_id
-                WHERE cm.channel = 'family' AND cm.family_id = ?
-                  AND cm.is_deleted = 0
-                ORDER BY cm.id DESC
-                LIMIT ?
-            ");
-            $stmt->bindValue(1, $familyId, PDO::PARAM_INT);
-            $stmt->bindValue(2, CHAT_MESSAGES_LIMIT, PDO::PARAM_INT);
-            $stmt->execute();
-            return array_reverse($stmt->fetchAll());
-        }
-        return $stmt->fetchAll();
-    }
+// Kanaal bepalen
+$channel = $_GET['channel'] ?? 'global';
+if ($channel === 'family' && !$userFamily) $channel = 'global';
+if (!in_array($channel, ['global','family'], true)) $channel = 'global';
 
-    // Global
-    if ($afterId > 0) {
-        $stmt = $pdo->prepare("
-            SELECT cm.*, u.username, u.xp, u.rank_title
-            FROM chat_messages cm
-            JOIN users u ON u.id = cm.user_id
-            WHERE cm.channel = 'global'
-              AND cm.id > ? AND cm.is_deleted = 0
-            ORDER BY cm.id ASC
-        ");
-        $stmt->execute([$afterId]);
-        return $stmt->fetchAll();
-    }
+$familyId = ($channel === 'family') ? (int)$userFamily['id'] : null;
 
-    $stmt = $pdo->prepare("
-        SELECT cm.*, u.username, u.xp, u.rank_title
-        FROM chat_messages cm
-        JOIN users u ON u.id = cm.user_id
-        WHERE cm.channel = 'global'
-          AND cm.is_deleted = 0
-        ORDER BY cm.id DESC
-        LIMIT ?
-    ");
-    $stmt->bindValue(1, CHAT_MESSAGES_LIMIT, PDO::PARAM_INT);
-    $stmt->execute();
-    return array_reverse($stmt->fetchAll());
-}
+// Update online
+updateChatOnline($pdo, $user['id']);
 
-/**
- * Verstuur bericht.
- */
-function sendChatMessage(PDO $pdo, int $userId, string $channel, ?int $familyId, string $body): array {
-    $body = trim($body);
+// Berichten ophalen
+$messages = getChatMessages($pdo, $channel, $familyId);
+$lastId = !empty($messages) ? (int)end($messages)['id'] : 0;
 
-    if (mb_strlen($body) < CHAT_MSG_MIN) {
-        return ['error' => 'Bericht mag niet leeg zijn.'];
-    }
-    if (mb_strlen($body) > CHAT_MSG_MAX) {
-        return ['error' => 'Bericht te lang (max ' . CHAT_MSG_MAX . ' tekens).'];
-    }
+// Online users
+$onlineUsers = getOnlineUsers($pdo);
 
-    // Cooldown check
-    $stmt = $pdo->prepare("
-        SELECT UNIX_TIMESTAMP(created_at) FROM chat_messages
-        WHERE user_id = ?
-        ORDER BY id DESC LIMIT 1
-    ");
-    $stmt->execute([$userId]);
-    $last = (int)$stmt->fetchColumn();
-    if ($last > 0 && (time() - $last) < CHAT_COOLDOWN_SEC) {
-        $wait = CHAT_COOLDOWN_SEC - (time() - $last);
-        return ['error' => "Wacht nog {$wait}s voor je weer stuurt."];
-    }
+$pageTitle = 'Chat — Vendetta';
+require __DIR__ . '/includes/header.php';
+?>
 
-    // Familie check
-    if ($channel === 'family') {
-        if (!$familyId) return ['error' => 'Je zit niet in een familie.'];
-        $stmt = $pdo->prepare("SELECT id FROM family_members WHERE user_id = ? AND family_id = ? LIMIT 1");
-        $stmt->execute([$userId, $familyId]);
-        if (!$stmt->fetch()) return ['error' => 'Je bent geen lid van deze familie.'];
-    }
+<div class="page-header">
+    <h1>💬 <span>Chat</span></h1>
+    <p>Praat met andere spelers in real-time.</p>
+</div>
 
-    try {
-        $pdo->prepare("
-            INSERT INTO chat_messages (channel, family_id, user_id, body)
-            VALUES (?, ?, ?, ?)
-        ")->execute([$channel, $channel === 'family' ? $familyId : null, $userId, $body]);
+<!-- Channel tabs -->
+<div class="chat-tabs">
+    <a href="?channel=global" class="chat-tab <?= $channel === 'global' ? 'active' : '' ?>">
+        🌍 <span>Global</span>
+        <span class="chat-tab-count"><?= $onlineCount ?> online</span>
+    </a>
+    <?php if ($userFamily): ?>
+        <a href="?channel=family" class="chat-tab <?= $channel === 'family' ? 'active' : '' ?>">
+            👥 <span><?= htmlspecialchars($userFamily['name']) ?></span>
+        </a>
+    <?php else: ?>
+        <span class="chat-tab disabled" title="Je zit niet in een familie">
+            👥 <span>Familie</span>
+        </span>
+    <?php endif; ?>
+</div>
 
-        $msgId = (int)$pdo->lastInsertId();
+<div class="chat-layout">
+    <!-- Chat box -->
+    <div class="chat-box"
+         id="chat-box"
+         data-channel="<?= htmlspecialchars($channel) ?>"
+         data-family="<?= $familyId ?? 0 ?>"
+         data-last-id="<?= $lastId ?>"
+         data-my-id="<?= (int)$user['id'] ?>"
+         data-is-admin="<?= !empty($user['is_admin']) ? 1 : 0 ?>">
 
-        // Update online status
-        updateChatOnline($pdo, $userId);
+        <!-- Berichten -->
+        <div class="chat-messages" id="chat-messages">
+            <?php if (empty($messages)): ?>
+                <div class="chat-empty">
+                    Nog geen berichten. Begin het gesprek! 👇
+                </div>
+            <?php endif; ?>
 
-        return ['success' => true, 'id' => $msgId];
-    } catch (Exception $e) {
-        return ['error' => 'Verzenden mislukt.'];
-    }
-}
+            <?php foreach ($messages as $m):
+                $color = chatRankColor((int)$m['xp']);
+                $isMine = (int)$m['user_id'] === (int)$user['id'];
+                $canDelete = $isMine || !empty($user['is_admin']);
+            ?>
+                <div class="chat-msg <?= $isMine ? 'mine' : '' ?>" data-id="<?= (int)$m['id'] ?>">
+                    <div class="cm-avatar" style="border-color: <?= $color ?>;">
+                        <?= strtoupper(mb_substr($m['username'], 0, 1)) ?>
+                    </div>
+                    <div class="cm-body">
+                        <div class="cm-head">
+                            <strong style="color: <?= $color ?>;"><?= htmlspecialchars($m['username']) ?></strong>
+                            <small class="cm-rank"><?= htmlspecialchars($m['rank_title']) ?></small>
+                            <time><?= chatTimeAgo($m['created_at']) ?></time>
+                            <?php if ($canDelete): ?>
+                                <button type="button" class="cm-delete"
+                                        data-id="<?= (int)$m['id'] ?>"
+                                        title="Verwijderen">×</button>
+                            <?php endif; ?>
+                        </div>
+                        <div class="cm-text"><?= nl2br(htmlspecialchars($m['body'])) ?></div>
+                    </div>
+                </div>
+            <?php endforeach; ?>
+        </div>
 
-// ============================================================
-// ONLINE STATUS
-// ============================================================
-function updateChatOnline(PDO $pdo, int $userId): void {
-    try {
-        $pdo->prepare("
-            INSERT INTO chat_online (user_id, last_seen)
-            VALUES (?, NOW())
-            ON DUPLICATE KEY UPDATE last_seen = NOW()
-        ")->execute([$userId]);
-    } catch (Exception $e) {}
-}
+        <!-- Input -->
+        <form class="chat-form" id="chat-form">
+            <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+            <input type="hidden" name="channel" value="<?= htmlspecialchars($channel) ?>">
 
-function getOnlineUsers(PDO $pdo): array {
-    $stmt = $pdo->prepare("
-        SELECT u.id, u.username, u.xp, co.last_seen
-        FROM chat_online co
-        JOIN users u ON u.id = co.user_id
-        WHERE co.last_seen > NOW() - INTERVAL ? SECOND
-        ORDER BY u.username ASC
-    ");
-    $stmt->bindValue(1, CHAT_ONLINE_WINDOW, PDO::PARAM_INT);
-    $stmt->execute();
-    return $stmt->fetchAll();
-}
+            <input type="text"
+                   name="body"
+                   id="chat-input"
+                   placeholder="Typ een bericht..."
+                   maxlength="<?= CHAT_MSG_MAX ?>"
+                   autocomplete="off"
+                   required>
 
-function countOnlineUsers(PDO $pdo): int {
-    $stmt = $pdo->prepare("
-        SELECT COUNT(*) FROM chat_online
-        WHERE last_seen > NOW() - INTERVAL ? SECOND
-    ");
-    $stmt->bindValue(1, CHAT_ONLINE_WINDOW, PDO::PARAM_INT);
-    $stmt->execute();
-    return (int)$stmt->fetchColumn();
-}
+            <button type="submit" class="btn btn-gold" id="chat-send">
+                Verstuur ➤
+            </button>
+        </form>
 
-// ============================================================
-// ADMIN: bericht verwijderen
-// ============================================================
-function deleteChatMessage(PDO $pdo, int $messageId, int $userId, bool $isAdmin): bool {
-    $stmt = $pdo->prepare("SELECT user_id FROM chat_messages WHERE id = ? LIMIT 1");
-    $stmt->execute([$messageId]);
-    $ownerId = (int)$stmt->fetchColumn();
+        <div class="chat-info-bar">
+            <span id="chat-typing">Max <?= CHAT_MSG_MAX ?> tekens · Cooldown <?= CHAT_COOLDOWN_SEC ?>s</span>
+            <span id="chat-status" class="chat-status"></span>
+        </div>
+    </div>
 
-    if (!$ownerId) return false;
-    if ($ownerId !== $userId && !$isAdmin) return false;
+    <!-- Sidebar: online users -->
+    <aside class="chat-sidebar">
+        <h3>🟢 Online (<?= count($onlineUsers) ?>)</h3>
 
-    $pdo->prepare("UPDATE chat_messages SET is_deleted = 1 WHERE id = ?")->execute([$messageId]);
-    return true;
-}
+        <?php if (empty($onlineUsers)): ?>
+            <p class="muted">Niemand online.</p>
+        <?php else: ?>
+            <ul class="chat-online-list" id="chat-online-list">
+                <?php foreach ($onlineUsers as $u):
+                    $color = chatRankColor((int)$u['xp']);
+                ?>
+                    <li data-user="<?= (int)$u['id'] ?>">
+                        <span class="cou-dot" style="background: <?= $color ?>;"></span>
+                        <span class="cou-name" style="color: <?= $color ?>;"><?= htmlspecialchars($u['username']) ?></span>
+                    </li>
+                <?php endforeach; ?>
+            </ul>
+        <?php endif; ?>
 
-// ============================================================
-// FORMATTING
-// ============================================================
-function chatRankColor(int $xp): string {
-    if (!function_exists('getRankData') || !function_exists('getRanksArray')) {
-        return '#a08d75';
-    }
-    $rank = getRankData($xp, getRanksArray());
-    return match($rank['level']) {
-        10 => '#ffb040',
-        9  => '#e8c877',
-        8  => '#c9a44c',
-        7  => '#b06aff',
-        6  => '#4a9dff',
-        5  => '#58e08c',
-        4  => '#8ac9ff',
-        default => '#a08d75',
-    };
-}
+        <div class="chat-sidebar-footer">
+            <a href="messages.php" class="btn btn-outline btn-full">💌 Privéberichten</a>
+        </div>
+    </aside>
+</div>
 
-function chatTimeAgo(string $datetime): string {
-    $diff = time() - strtotime($datetime);
-    if ($diff < 60) return 'nu';
-    if ($diff < 3600) return floor($diff / 60) . 'm';
-    if ($diff < 86400) return date('H:i', strtotime($datetime));
-    return date('d M', strtotime($datetime));
-}
+<script src="assets/js/chat.js"></script>
+
+<?php require __DIR__ . '/includes/footer.php'; ?>

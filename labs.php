@@ -1,169 +1,249 @@
 <?php
-// Lab & fabriek configuratie
+require_once __DIR__ . '/config/db.php';
+if (!isLoggedIn()) redirect('login.php');
 
-const AMMO_TYPES = [
-    'pistool'  => ['name' => 'Pistool kogels',  'icon' => '🔫'],
-    'geweer'   => ['name' => 'Geweer kogels',   'icon' => '🎯'],
-    'shotgun'  => ['name' => 'Shotgun patronen', 'icon' => '💥'],
-];
+$user = currentUser($pdo);
+$country = getCountry($pdo, $user['current_country']);
+$allLabs = getAllLabs($pdo);
+$myLabs = getUserLabs($pdo, $user['id'], $user['current_country']);
+$activeProduction = getActiveProduction($pdo, $user['id']);
 
-const AMMO_PER_ATTACK = 5;         // kogels per aanval
-const AMMO_DAMAGE_BONUS = 5;       // extra schade als je munitie gebruikt
-const AMMO_MAX_PER_TYPE = 100000;
+$error = null;
+$result = null;
 
-/**
- * Haal alle labs op.
- */
-function getAllLabs(PDO $pdo): array {
-    $stmt = $pdo->query("SELECT * FROM labs ORDER BY price ASC");
-    return $stmt->fetchAll();
-}
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    $csrf = $_POST['csrf'] ?? '';
 
-/**
- * Haal één lab op.
- */
-function getLab(PDO $pdo, string $key): ?array {
-    $stmt = $pdo->prepare("SELECT * FROM labs WHERE `key` = ? LIMIT 1");
-    $stmt->execute([$key]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
-
-/**
- * Labs van user in bepaald land.
- */
-function getUserLabs(PDO $pdo, int $userId, ?string $countryKey = null): array {
-    $sql = "SELECT ul.*, l.name, l.lab_type, l.batch_size, l.process_time_minutes
-            FROM user_labs ul
-            JOIN labs l ON l.`key` = ul.lab_key
-            WHERE ul.user_id = ?";
-    $params = [$userId];
-    if ($countryKey) {
-        $sql .= " AND ul.country_key = ?";
-        $params[] = $countryKey;
+    if (!hash_equals(csrf_token(), $csrf)) {
+        $error = 'Ongeldige sessie.';
     }
-    $sql .= " ORDER BY ul.bought_at DESC";
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute($params);
-    return $stmt->fetchAll();
-}
+    // === LAB KOPEN ===
+    elseif ($action === 'buy_lab') {
+        $labKey = $_POST['lab_key'] ?? '';
+        $lab = getLab($pdo, $labKey);
 
-/**
- * Heeft user een lab van dit type in dit land?
- */
-function hasLabInCountry(PDO $pdo, int $userId, string $countryKey, string $labKey): bool {
-    $stmt = $pdo->prepare("SELECT id FROM user_labs WHERE user_id = ? AND country_key = ? AND lab_key = ? LIMIT 1");
-    $stmt->execute([$userId, $countryKey, $labKey]);
-    return (bool)$stmt->fetch();
-}
+        if (!$lab) {
+            $error = 'Onbekend lab.';
+        } elseif (hasLabInCountry($pdo, $user['id'], $user['current_country'], $labKey)) {
+            $error = 'Je hebt dit lab al in dit land.';
+        } elseif ($user['money'] < $lab['price']) {
+            $error = 'Je hebt niet genoeg geld.';
+        } else {
+            $pdo->beginTransaction();
+            try {
+                $pdo->prepare("UPDATE users SET money = money - ? WHERE id = ?")
+                    ->execute([$lab['price'], $user['id']]);
+                $pdo->prepare("INSERT INTO user_labs (user_id, country_key, lab_key) VALUES (?, ?, ?)")
+                    ->execute([$user['id'], $user['current_country'], $labKey]);
 
-/**
- * Actieve producties van user.
- */
-function getActiveProduction(PDO $pdo, int $userId): array {
-    $stmt = $pdo->prepare("
-        SELECT ulp.*, l.name AS lab_name, l.lab_type
-        FROM user_lab_production ulp
-        JOIN labs l ON l.`key` = ulp.lab_key
-        WHERE ulp.user_id = ? AND ulp.collected = 0
-        ORDER BY ulp.ready_at ASC
-    ");
-    $stmt->execute([$userId]);
-    return $stmt->fetchAll();
-}
+                logActivity($pdo, $user['id'],
+                    "🧪 {$lab['name']} gekocht in {$country['name']} voor €" . number_format($lab['price'], 0, ',', '.'));
+                $pdo->commit();
 
-/**
- * Alle kogelfabrieken.
- */
-function getAllFactories(PDO $pdo): array {
-    $stmt = $pdo->query("SELECT * FROM bullet_factories ORDER BY price ASC");
-    return $stmt->fetchAll();
-}
-
-/**
- * Kogelfabriek ophalen.
- */
-function getFactory(PDO $pdo, string $key): ?array {
-    $stmt = $pdo->prepare("SELECT * FROM bullet_factories WHERE `key` = ? LIMIT 1");
-    $stmt->execute([$key]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
-
-/**
- * Kogelfabrieken van user.
- */
-function getUserFactories(PDO $pdo, int $userId, ?string $countryKey = null): array {
-    $sql = "SELECT uf.*, bf.name, bf.yield_per_batch, bf.process_time_minutes, bf.material_cost
-            FROM user_factories uf
-            JOIN bullet_factories bf ON bf.`key` = uf.factory_key
-            WHERE uf.user_id = ?";
-    $params = [$userId];
-    if ($countryKey) {
-        $sql .= " AND uf.country_key = ?";
-        $params[] = $countryKey;
+                $result = "Je hebt een {$lab['name']} geopend!";
+                $user = currentUser($pdo);
+                $myLabs = getUserLabs($pdo, $user['id'], $user['current_country']);
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                $error = 'Aankoop mislukt.';
+            }
+        }
     }
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute($params);
-    return $stmt->fetchAll();
-}
+    // === PRODUCTIE STARTEN ===
+    elseif ($action === 'produce') {
+        $labKey = $_POST['lab_key'] ?? '';
+        $lab = getLab($pdo, $labKey);
 
-/**
- * Munitie van user.
- */
-function getUserAmmo(PDO $pdo, int $userId): array {
-    $stmt = $pdo->prepare("SELECT * FROM user_ammo WHERE user_id = ?");
-    $stmt->execute([$userId]);
-    $rows = $stmt->fetchAll();
-    $out = [];
-    foreach ($rows as $r) {
-        $out[$r['ammo_key']] = (int)$r['quantity'];
+        if (!$lab || !hasLabInCountry($pdo, $user['id'], $user['current_country'], $labKey)) {
+            $error = 'Je hebt dit lab niet in dit land.';
+        } else {
+            // Check of er al een actieve batch is
+            $stmt = $pdo->prepare("
+                SELECT COUNT(*) FROM user_lab_production
+                WHERE user_id = ? AND lab_key = ? AND collected = 0
+            ");
+            $stmt->execute([$user['id'], $labKey]);
+            if ((int)$stmt->fetchColumn() > 0) {
+                $error = 'Dit lab is al bezig met een productie.';
+            } else {
+                $readyAt = date('Y-m-d H:i:s', time() + ($lab['process_time_minutes'] * 60));
+                $pdo->prepare("
+                    INSERT INTO user_lab_production (user_id, lab_key, ready_at, batch_amount)
+                    VALUES (?, ?, ?, ?)
+                ")->execute([$user['id'], $labKey, $readyAt, $lab['batch_size']]);
+
+                logActivity($pdo, $user['id'],
+                    "🧪 Productie gestart in {$lab['name']} ({$lab['batch_size']}x {$lab['lab_type']})");
+                $result = "Productie gestart! Klaar over {$lab['process_time_minutes']} minuten.";
+                $activeProduction = getActiveProduction($pdo, $user['id']);
+            }
+        }
     }
-    return $out;
+    // === OOGSTEN ===
+    elseif ($action === 'collect') {
+        $prodId = (int)($_POST['prod_id'] ?? 0);
+        $stmt = $pdo->prepare("
+            SELECT ulp.*, l.lab_type, l.name AS lab_name
+            FROM user_lab_production ulp
+            JOIN labs l ON l.`key` = ulp.lab_key
+            WHERE ulp.id = ? AND ulp.user_id = ? AND ulp.collected = 0
+            LIMIT 1
+        ");
+        $stmt->execute([$prodId, $user['id']]);
+        $prod = $stmt->fetch();
+
+        if (!$prod) {
+            $error = 'Productie niet gevonden.';
+        } elseif (strtotime($prod['ready_at']) > time()) {
+            $error = 'Deze batch is nog niet klaar.';
+        } else {
+            $drugKey = $prod['lab_type']; // cocaine / meth / xtc
+            $pdo->beginTransaction();
+            try {
+                $pdo->prepare("UPDATE user_lab_production SET collected = 1 WHERE id = ?")
+                    ->execute([$prodId]);
+                addDrug($pdo, $user['id'], $drugKey, (int)$prod['batch_amount']);
+
+                logActivity($pdo, $user['id'],
+                    "✅ {$prod['batch_amount']}x {$drugKey} geproduceerd in {$prod['lab_name']}");
+                $pdo->commit();
+
+                $result = "Je hebt {$prod['batch_amount']}x " . ucfirst($drugKey) . " geproduceerd!";
+                $activeProduction = getActiveProduction($pdo, $user['id']);
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                $error = 'Oogsten mislukt.';
+            }
+        }
+    }
 }
 
-/**
- * Voeg munitie toe.
- */
-function addAmmo(PDO $pdo, int $userId, string $ammoKey, int $amount): void {
-    $pdo->prepare("
-        INSERT INTO user_ammo (user_id, ammo_key, quantity)
-        VALUES (?, ?, ?)
-        ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)
-    ")->execute([$userId, $ammoKey, $amount]);
-}
+$pageTitle = 'Labs — Vendetta';
+require __DIR__ . '/includes/header.php';
+?>
 
-/**
- * Verwijder munitie (returns true bij succes).
- */
-function removeAmmo(PDO $pdo, int $userId, string $ammoKey, int $amount): bool {
-    $stmt = $pdo->prepare("SELECT quantity FROM user_ammo WHERE user_id = ? AND ammo_key = ?");
-    $stmt->execute([$userId, $ammoKey]);
-    $have = (int)($stmt->fetchColumn() ?: 0);
-    if ($have < $amount) return false;
-    $pdo->prepare("UPDATE user_ammo SET quantity = quantity - ? WHERE user_id = ? AND ammo_key = ?")
-        ->execute([$amount, $userId, $ammoKey]);
-    return true;
-}
+<div class="page-header">
+    <h1>Drugs <span>laboratoria</span></h1>
+    <p><?= $country['flag'] ?> <?= htmlspecialchars($country['name']) ?> — produceer cocaïne, meth en XTC in bulk.</p>
+</div>
 
-/**
- * Totaal aantal kogels van user.
- */
-function getTotalAmmo(array $ammo): int {
-    return array_sum($ammo);
-}
+<?php if ($error): ?>
+    <div class="alert alert-error"><?= htmlspecialchars($error) ?></div>
+<?php endif; ?>
+<?php if ($result): ?>
+    <div class="alert alert-success">✅ <?= htmlspecialchars($result) ?></div>
+<?php endif; ?>
 
-/**
- * Actieve kogel-producties.
- */
-function getActiveBulletProduction(PDO $pdo, int $userId): array {
-    $stmt = $pdo->prepare("
-        SELECT ubp.*, bf.name AS factory_name
-        FROM user_bullet_production ubp
-        JOIN bullet_factories bf ON bf.`key` = ubp.factory_key
-        WHERE ubp.user_id = ? AND ubp.collected = 0
-        ORDER BY ubp.ready_at ASC
-    ");
-    $stmt->execute([$userId]);
-    return $stmt->fetchAll();
-}
+<!-- Stats -->
+<div class="stat-grid">
+    <div class="stat-card">
+        <div class="stat-icon">💰</div>
+        <div class="stat-value gold">€<?= number_format($user['money'], 0, ',', '.') ?></div>
+        <div class="stat-label">Cash</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">🧪</div>
+        <div class="stat-value"><?= count($myLabs) ?></div>
+        <div class="stat-label">Labs in <?= htmlspecialchars($country['name']) ?></div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon">⚙️</div>
+        <div class="stat-value"><?= count($activeProduction) ?></div>
+        <div class="stat-label">Actieve batches</div>
+    </div>
+</div>
+
+<!-- Actieve producties -->
+<?php if (!empty($activeProduction)): ?>
+<section class="section">
+    <h2>Actieve producties</h2>
+    <div class="plant-grid">
+        <?php foreach ($activeProduction as $prod):
+            $ready = strtotime($prod['ready_at']) <= time();
+        ?>
+        <div class="plant-card <?= $ready ? 'ready' : '' ?>">
+            <div class="plant-icon"><?= $ready ? '✅' : '⚗️' ?></div>
+            <h3><?= htmlspecialchars($prod['lab_name']) ?></h3>
+            <p class="muted">
+                <?= $ready ? 'Klaar om te oogsten' : 'Klaar in: ' . timeUntil($prod['ready_at']) ?>
+            </p>
+            <p><strong><?= (int)$prod['batch_amount'] ?>x <?= htmlspecialchars($prod['lab_type']) ?></strong></p>
+            <?php if ($ready): ?>
+                <form method="POST">
+                    <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+                    <input type="hidden" name="action" value="collect">
+                    <input type="hidden" name="prod_id" value="<?= (int)$prod['id'] ?>">
+                    <button type="submit" class="btn btn-gold btn-full">Oogsten</button>
+                </form>
+            <?php endif; ?>
+        </div>
+        <?php endforeach; ?>
+    </div>
+</section>
+<?php endif; ?>
+
+<!-- Beschikbare labs -->
+<section class="section">
+    <h2>Beschikbare labs</h2>
+
+    <div class="house-grid">
+        <?php foreach ($allLabs as $lab):
+            $owned = hasLabInCountry($pdo, $user['id'], $user['current_country'], $lab['key']);
+            $canAfford = $user['money'] >= $lab['price'];
+            $busy = false;
+            foreach ($activeProduction as $p) {
+                if ($p['lab_key'] === $lab['key']) { $busy = true; break; }
+            }
+        ?>
+        <div class="house-card <?= $owned ? 'owned' : '' ?>">
+            <div class="house-head">
+                <span class="house-icon">
+                    <?= $lab['lab_type'] === 'cocaine' ? '❄️' : ($lab['lab_type'] === 'meth' ? '💎' : '💊') ?>
+                </span>
+                <h3><?= htmlspecialchars($lab['name']) ?></h3>
+            </div>
+            <p><?= htmlspecialchars($lab['description']) ?></p>
+
+            <div class="house-stats">
+                <div class="house-stat">
+                    <span>📦</span>
+                    <strong><?= (int)$lab['batch_size'] ?>x <?= htmlspecialchars($lab['lab_type']) ?> per batch</strong>
+                </div>
+                <div class="house-stat">
+                    <span>⏱️</span>
+                    <strong><?= (int)$lab['process_time_minutes'] ?> min per batch</strong>
+                </div>
+            </div>
+
+            <div class="house-footer">
+                <?php if ($owned): ?>
+                    <span class="badge-equipped">In bezit</span>
+                    <?php if ($busy): ?>
+                        <button class="btn btn-outline" disabled>Bezig...</button>
+                    <?php else: ?>
+                        <form method="POST">
+                            <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+                            <input type="hidden" name="action" value="produce">
+                            <input type="hidden" name="lab_key" value="<?= htmlspecialchars($lab['key']) ?>">
+                            <button type="submit" class="btn btn-gold">Productie starten</button>
+                        </form>
+                    <?php endif; ?>
+                <?php else: ?>
+                    <strong class="price">€<?= number_format($lab['price'], 0, ',', '.') ?></strong>
+                    <form method="POST">
+                        <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
+                        <input type="hidden" name="action" value="buy_lab">
+                        <input type="hidden" name="lab_key" value="<?= htmlspecialchars($lab['key']) ?>">
+                        <button type="submit" class="btn btn-gold" <?= !$canAfford ? 'disabled' : '' ?>>
+                            <?= !$canAfford ? 'Te duur' : 'Kopen' ?>
+                        </button>
+                    </form>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endforeach; ?>
+    </div>
+</section>
+
+<?php require __DIR__ . '/includes/footer.php'; ?>
